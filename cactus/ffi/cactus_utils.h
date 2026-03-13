@@ -1,0 +1,1114 @@
+#ifndef CACTUS_UTILS_H
+#define CACTUS_UTILS_H
+
+#include "../engine/engine.h"
+#include "../models/model.h"
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <stdexcept>
+#include <sstream>
+#include <iomanip>
+#include <fstream>
+#include <iostream>
+#include <filesystem>
+#include <cctype>
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <memory>
+#include <atomic>
+#include <mutex>
+#include <random>
+
+#ifdef __APPLE__
+#include <uuid/uuid.h>
+#include <mach/mach.h>
+#elif defined(_WIN32)
+#include <windows.h>
+#include <psapi.h>
+#elif defined(__linux__) || defined(__ANDROID__)
+#include <unistd.h>
+#endif
+
+inline size_t get_memory_footprint_bytes() {
+#ifdef __APPLE__
+    task_vm_info_data_t vm_info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm_info, &count) == KERN_SUCCESS)
+        return vm_info.phys_footprint;
+
+#elif defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS_EX pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc)))
+        return pmc.PrivateUsage;
+        
+#elif defined(__linux__) || defined(__ANDROID__)
+    std::ifstream statm("/proc/self/statm");
+    if (statm.is_open()) {
+        size_t size, resident;
+        statm >> size >> resident;
+        return resident * sysconf(_SC_PAGESIZE);
+    }
+#endif
+    return 0;
+}
+
+inline double get_ram_usage_mb() {
+    return get_memory_footprint_bytes() / (1024.0 * 1024.0);
+}
+
+struct CactusModelHandle {
+    std::unique_ptr<cactus::engine::Model> model;
+    std::unique_ptr<cactus::engine::Model> vad_model;
+    std::atomic<bool> should_stop;
+    std::vector<uint32_t> processed_tokens;
+    std::mutex model_mutex;
+    std::string model_name;
+    std::unique_ptr<cactus::engine::index::Index> corpus_index;
+    std::string corpus_dir;
+    size_t corpus_embedding_dim = 0;
+    std::vector<std::vector<float>> tool_embeddings;
+    std::vector<std::string> tool_texts;
+
+    CactusModelHandle() : should_stop(false) {}
+};
+
+extern std::string last_error_message;
+
+bool matches_stop_sequence(const std::vector<uint32_t>& generated_tokens,
+                           const std::vector<std::vector<uint32_t>>& stop_sequences);
+
+std::string retrieve_rag_context(CactusModelHandle* handle, const std::string& query);
+
+namespace cactus {
+namespace audio {
+
+static constexpr size_t WHISPER_TARGET_FRAMES = 3000;
+static constexpr int WHISPER_SAMPLE_RATE = 16000;
+
+inline cactus::engine::AudioProcessor::SpectrogramConfig get_whisper_spectrogram_config() {
+    cactus::engine::AudioProcessor::SpectrogramConfig cfg{};
+    cfg.n_fft        = 400;
+    cfg.frame_length = 400;
+    cfg.hop_length   = 160;
+    cfg.power        = 2.0f;
+    cfg.center       = true;
+    cfg.pad_mode     = "reflect";
+    cfg.onesided     = true;
+    cfg.dither       = 0.0f;
+    cfg.mel_floor    = 1e-10f;
+    cfg.log_mel      = "log10";
+    cfg.reference    = 1.0f;
+    cfg.min_value    = 1e-10f;
+    cfg.remove_dc_offset = true;
+    return cfg;
+}
+
+inline cactus::engine::AudioProcessor::SpectrogramConfig get_parakeet_spectrogram_config() {
+    cactus::engine::AudioProcessor::SpectrogramConfig cfg{};
+    cfg.n_fft        = 512;
+    cfg.frame_length = 400;
+    cfg.hop_length   = 160;
+    cfg.power        = 2.0f;
+    cfg.center       = true;
+    cfg.pad_mode     = "constant";
+    cfg.onesided     = true;
+    cfg.dither       = 0.0f;
+    cfg.mel_floor    = 5.960464477539063e-08f; // 2^-24 guard value used by HF Parakeet.
+    cfg.log_mel      = "log";
+    cfg.reference    = 1.0f;
+    cfg.min_value    = 1e-10f;
+    cfg.remove_dc_offset = false;
+    cfg.hann_periodic = false;
+    return cfg;
+}
+
+inline void apply_preemphasis(std::vector<float>& waveform, float coefficient = 0.97f) {
+    if (waveform.size() < 2 || coefficient == 0.0f) {
+        return;
+    }
+    for (size_t i = waveform.size() - 1; i > 0; --i) {
+        waveform[i] -= coefficient * waveform[i - 1];
+    }
+}
+
+inline void normalize_parakeet_log_mel(std::vector<float>& mel, size_t num_mels, float epsilon = 1e-5f) {
+    if (mel.empty() || num_mels == 0 || (mel.size() % num_mels) != 0) {
+        return;
+    }
+    const size_t num_frames = mel.size() / num_mels;
+    if (num_frames == 0) {
+        return;
+    }
+
+    for (size_t m = 0; m < num_mels; ++m) {
+        const size_t base = m * num_frames;
+        float mean = 0.0f;
+        for (size_t t = 0; t < num_frames; ++t) {
+            mean += mel[base + t];
+        }
+        mean /= static_cast<float>(num_frames);
+
+        float variance = 0.0f;
+        for (size_t t = 0; t < num_frames; ++t) {
+            const float d = mel[base + t] - mean;
+            variance += d * d;
+        }
+        const float denom = static_cast<float>(std::max<size_t>(1, num_frames - 1));
+        const float inv_std = 1.0f / std::sqrt((variance / denom) + epsilon);
+        for (size_t t = 0; t < num_frames; ++t) {
+            mel[base + t] = (mel[base + t] - mean) * inv_std;
+        }
+    }
+}
+
+inline void trim_mel_frames(std::vector<float>& mel, size_t num_mels, size_t valid_frames) {
+    if (mel.empty() || num_mels == 0 || (mel.size() % num_mels) != 0) {
+        return;
+    }
+    size_t total_frames = mel.size() / num_mels;
+    if (valid_frames == 0 || valid_frames >= total_frames) {
+        return;
+    }
+    std::vector<float> trimmed(num_mels * valid_frames);
+    for (size_t m = 0; m < num_mels; ++m) {
+        const float* src = &mel[m * total_frames];
+        float* dst = &trimmed[m * valid_frames];
+        std::copy(src, src + valid_frames, dst);
+    }
+    mel.swap(trimmed);
+}
+
+} // namespace audio
+} // namespace cactus
+
+namespace cactus {
+namespace ffi {
+
+inline bool env_flag_enabled(const char* key) {
+    const char* value = std::getenv(key);
+    return value && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+}
+
+inline std::string generateUUID() {
+#ifdef __APPLE__
+    uuid_t uuid;
+    uuid_generate_random(uuid);
+    char uuid_str[37];
+    uuid_unparse_lower(uuid, uuid_str);
+    return std::string(uuid_str);
+#else
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    static std::uniform_int_distribution<> dis(0, 15);
+    static std::uniform_int_distribution<> dis2(8, 11);
+
+    std::stringstream ss;
+    ss << std::hex;
+    for (int i = 0; i < 8; i++) ss << dis(gen);
+    ss << "-";
+    for (int i = 0; i < 4; i++) ss << dis(gen);
+    ss << "-4";
+    for (int i = 0; i < 3; i++) ss << dis(gen);
+    ss << "-";
+    ss << dis2(gen);
+    for (int i = 0; i < 3; i++) ss << dis(gen);
+    ss << "-";
+    for (int i = 0; i < 12; i++) ss << dis(gen);
+    return ss.str();
+#endif
+}
+
+struct ToolFunction {
+    std::string name;
+    std::string description;
+    std::unordered_map<std::string, std::string> parameters;
+};
+
+} // namespace ffi
+} // namespace cactus
+
+std::vector<cactus::ffi::ToolFunction> select_relevant_tools(
+    CactusModelHandle* handle,
+    const std::string& query,
+    const std::vector<cactus::ffi::ToolFunction>& all_tools,
+    size_t top_k);
+
+#include "gemma_tools.h"
+
+namespace cactus {
+namespace ffi {
+
+inline std::string escape_json_string(const std::string& s) {
+    std::ostringstream o;
+    for (char c : s) {
+        if (c == '"') o << "\\\"";
+        else if (c == '\n') o << "\\n";
+        else if (c == '\r') o << "\\r";
+        else if (c == '\t') o << "\\t";
+        else if (c == '\\') o << "\\\\";
+        else o << c;
+    }
+    return o.str();
+}
+
+
+inline std::string trim_string(const std::string& s) {
+    size_t start = 0;
+    while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) ++start;
+    size_t end = s.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) --end;
+    return s.substr(start, end - start);
+}
+
+inline std::string env_or_default(const char* key, const char* fallback) {
+    const char* v = std::getenv(key);
+    if (v && v[0] != '\0') return std::string(v);
+    return std::string(fallback);
+}
+
+inline std::string json_string_field(const std::string& json, const std::string& key) {
+    std::string pattern = "\"" + key + "\":";
+    size_t pos = json.find(pattern);
+    if (pos == std::string::npos) return {};
+
+    size_t i = pos + pattern.size();
+    while (i < json.size() && std::isspace(static_cast<unsigned char>(json[i]))) i++;
+    if (i >= json.size() || json[i] != '"') return {};
+    ++i;
+
+    std::string out;
+    out.reserve(128);
+    while (i < json.size()) {
+        char c = json[i++];
+        if (c == '"') return out;
+        if (c == '\\' && i < json.size()) {
+            char e = json[i++];
+            switch (e) {
+                case '"':  out.push_back('"');  break;
+                case '\\': out.push_back('\\'); break;
+                case '/':  out.push_back('/');  break;
+                case 'b':  out.push_back('\b'); break;
+                case 'f':  out.push_back('\f'); break;
+                case 'n':  out.push_back('\n'); break;
+                case 'r':  out.push_back('\r'); break;
+                case 't':  out.push_back('\t'); break;
+                default:   out.push_back(e);    break;
+            }
+            continue;
+        }
+        out.push_back(c);
+    }
+    return {};
+}
+
+inline std::string json_array_field(const std::string& json, const std::string& key) {
+    std::string pattern = "\"" + key + "\":";
+    size_t pos = json.find(pattern);
+    if (pos == std::string::npos) return "[]";
+    size_t start = pos + pattern.size();
+    while (start < json.size() && std::isspace(static_cast<unsigned char>(json[start]))) ++start;
+    if (start >= json.size() || json[start] != '[') return "[]";
+
+    int depth = 1;
+    size_t end = start + 1;
+    while (end < json.size() && depth > 0) {
+        if (json[end] == '[') depth++;
+        else if (json[end] == ']') depth--;
+        end++;
+    }
+    return json.substr(start, end - start);
+}
+
+inline std::vector<std::string> split_json_array(const std::string& array_json) {
+    std::vector<std::string> out;
+    if (array_json.size() < 2 || array_json.front() != '[' || array_json.back() != ']') return out;
+
+    size_t i = 1;
+    while (i + 1 < array_json.size()) {
+        while (i + 1 < array_json.size() &&
+               (std::isspace(static_cast<unsigned char>(array_json[i])) || array_json[i] == ',')) i++;
+        if (i + 1 >= array_json.size() || array_json[i] != '{') break;
+
+        size_t start = i;
+        int depth = 0;
+        bool in_str = false;
+        bool esc = false;
+        for (; i < array_json.size(); ++i) {
+            char c = array_json[i];
+            if (in_str) {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') in_str = false;
+                continue;
+            }
+            if (c == '"') { in_str = true; continue; }
+            if (c == '{') depth++;
+            if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    out.push_back(array_json.substr(start, i - start + 1));
+                    i++;
+                    break;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+inline std::string serialize_tools_json(const std::vector<ToolFunction>& tools) {
+    if (tools.empty()) return "";
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < tools.size(); ++i) {
+        if (i > 0) oss << ",";
+        oss << "{\"type\":\"function\",\"function\":{";
+        oss << "\"name\":\"" << escape_json_string(tools[i].name) << "\",";
+        oss << "\"description\":\"" << escape_json_string(tools[i].description) << "\"";
+        auto it = tools[i].parameters.find("schema");
+        if (it != tools[i].parameters.end()) {
+            oss << ",\"parameters\":" << it->second;
+        }
+        oss << "}}";
+    }
+    oss << "]";
+    return oss.str();
+}
+
+inline void handle_error_response(const std::string& error_message, char* response_buffer, size_t buffer_size) {
+    std::ostringstream json;
+    json << "{";
+    json << "\"success\":false,";
+    json << "\"error\":\"" << escape_json_string(error_message) << "\",";
+    json << "\"cloud_handoff\":false,";
+    json << "\"response\":null,";
+    json << "\"function_calls\":[],";
+    json << "\"confidence\":0.0,";
+    json << "\"time_to_first_token_ms\":0.0,";
+    json << "\"total_time_ms\":0.0,";
+    json << "\"prefill_tps\":0.0,";
+    json << "\"decode_tps\":0.0,";
+    json << "\"ram_usage_mb\":" << std::fixed << std::setprecision(2) << get_ram_usage_mb() << ",";
+    json << "\"prefill_tokens\":0,";
+    json << "\"decode_tokens\":0,";
+    json << "\"total_tokens\":0";
+    json << "}";
+    std::string error_json = json.str();
+    if (response_buffer && error_json.length() < buffer_size) {
+        std::strcpy(response_buffer, error_json.c_str());
+    }
+}
+
+inline std::vector<cactus::engine::ChatMessage> parse_messages_json(const std::string& json, 
+                                                                   std::vector<std::string>& out_image_paths) {
+    std::vector<cactus::engine::ChatMessage> messages;
+    out_image_paths.clear();
+    
+    size_t pos = json.find('[');
+    if (pos == std::string::npos) {
+        throw std::runtime_error("Invalid JSON: expected array");
+    }
+    
+    pos = json.find('{', pos);
+    while (pos != std::string::npos) {
+        cactus::engine::ChatMessage msg;
+        
+        size_t obj_start = pos;
+        int brace_count = 1;
+        size_t obj_end = obj_start + 1;
+        while (obj_end < json.length() && brace_count > 0) {
+            if (json[obj_end] == '{') brace_count++;
+            else if (json[obj_end] == '}') brace_count--;
+            obj_end++;
+        }
+
+        size_t role_pos = json.find("\"role\"", pos);
+        if (role_pos == std::string::npos || role_pos >= obj_end) break;
+        
+        size_t role_start = json.find('"', role_pos + 6) + 1;
+        size_t role_end = json.find('"', role_start);
+        msg.role = json.substr(role_start, role_end - role_start);
+        
+        size_t content_pos = json.find("\"content\"", role_end);
+        if (content_pos != std::string::npos && content_pos < obj_end) {
+            size_t content_start = json.find('"', content_pos + 9) + 1;
+            size_t content_end = content_start;
+            
+            while (content_end < json.length()) {
+                content_end = json.find('"', content_end);
+                if (content_end == std::string::npos) break;
+                if (json[content_end - 1] != '\\') break;
+                content_end++;
+            }
+            
+            msg.content = json.substr(content_start, content_end - content_start);
+            
+            size_t escape_pos = 0;
+            while ((escape_pos = msg.content.find("\\n", escape_pos)) != std::string::npos) {
+                msg.content.replace(escape_pos, 2, "\n");
+                escape_pos += 1;
+            }
+            escape_pos = 0;
+            while ((escape_pos = msg.content.find("\\\"", escape_pos)) != std::string::npos) {
+                msg.content.replace(escape_pos, 2, "\"");
+                escape_pos += 1;
+            }
+        }
+        
+        size_t images_pos = json.find("\"images\"", pos);
+        if (images_pos != std::string::npos && images_pos < obj_end) {
+            size_t array_start = json.find('[', images_pos);
+            if (array_start != std::string::npos && array_start < obj_end) {
+                size_t array_end = json.find(']', array_start);
+                if (array_end != std::string::npos && array_end < obj_end) {
+                    size_t img_pos = array_start;
+                    while (true) {
+                        img_pos = json.find('"', img_pos + 1);
+                        if (img_pos == std::string::npos || img_pos >= array_end) break;
+                        
+                        size_t img_start = img_pos + 1;
+                        size_t img_end = json.find('"', img_start);
+                        if (img_end == std::string::npos || img_end > array_end) break;
+                        
+                        std::string img_path = json.substr(img_start, img_end - img_start);
+                        
+                        std::filesystem::path p(img_path);
+                        img_path = std::filesystem::absolute(p).string();
+                        
+                        msg.images.push_back(img_path);
+                        out_image_paths.push_back(img_path);
+                        img_pos = img_end;
+                    }
+                }
+            }
+        }
+        
+        messages.push_back(msg);
+        
+        pos = json.find('{', obj_end);
+    }
+    
+    return messages;
+}
+
+inline std::vector<ToolFunction> parse_tools_json(const std::string& json) {
+    std::vector<ToolFunction> tools;
+    
+    if (json.empty()) return tools;
+    
+    size_t pos = json.find('[');
+    if (pos == std::string::npos) return tools;
+    
+    pos = json.find("\"function\"", pos);
+    while (pos != std::string::npos) {
+        ToolFunction tool;
+        
+        size_t name_pos = json.find("\"name\"", pos);
+        if (name_pos != std::string::npos) {
+            size_t name_start = json.find('"', name_pos + 6) + 1;
+            size_t name_end = json.find('"', name_start);
+            tool.name = json.substr(name_start, name_end - name_start);
+        }
+        
+        size_t desc_pos = json.find("\"description\"", pos);
+        if (desc_pos != std::string::npos) {
+            size_t desc_start = json.find('"', desc_pos + 13) + 1;
+            size_t desc_end = json.find('"', desc_start);
+            tool.description = json.substr(desc_start, desc_end - desc_start);
+        }
+        
+        size_t params_pos = json.find("\"parameters\"", pos);
+        if (params_pos != std::string::npos) {
+            size_t params_start = json.find('{', params_pos);
+            if (params_start != std::string::npos) {
+                int brace_count = 1;
+                size_t params_end = params_start + 1;
+                while (params_end < json.length() && brace_count > 0) {
+                    if (json[params_end] == '{') brace_count++;
+                    else if (json[params_end] == '}') brace_count--;
+                    params_end++;
+                }
+                tool.parameters["schema"] = json.substr(params_start, params_end - params_start);
+            }
+        }
+        
+        tools.push_back(tool);
+        
+        pos = json.find("\"function\"", name_pos);
+    }
+
+    return tools;
+}
+
+inline bool try_parse_json_float(const std::string& json, const std::string& key, float& out_value) {
+    std::string pattern = "\"" + key + "\":";
+    size_t pos = json.find(pattern);
+    if (pos == std::string::npos) return false;
+
+    size_t start = pos + pattern.size();
+    while (start < json.size() && std::isspace(static_cast<unsigned char>(json[start]))) ++start;
+
+    size_t end = start;
+    while (end < json.size() && std::string(",}] \t\n\r").find(json[end]) == std::string::npos) ++end;
+
+    try {
+        out_value = std::stof(json.substr(start, end - start));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+inline std::vector<std::string> parse_json_string_array_field(const std::string& json, const std::string& key) {
+    std::vector<std::string> out;
+    std::string pattern = "\"" + key + "\":";
+    size_t pos = json.find(pattern);
+    if (pos == std::string::npos) return out;
+
+    size_t start = pos + pattern.size();
+    while (start < json.size() && std::isspace(static_cast<unsigned char>(json[start]))) ++start;
+    if (start >= json.size() || json[start] != '[') return out;
+
+    int depth = 1;
+    bool in_string = false;
+    bool escaped = false;
+    size_t end = start + 1;
+
+    while (end < json.size() && depth > 0) {
+        char c = json[end];
+        if (in_string) {
+            if (escaped) escaped = false;
+            else if (c == '\\') escaped = true;
+            else if (c == '"') in_string = false;
+        } else {
+            if (c == '"') in_string = true;
+            else if (c == '[') depth++;
+            else if (c == ']') depth--;
+        }
+        ++end;
+    }
+
+    if (depth != 0) return out;
+    const std::string array_json = json.substr(start, end - start);
+    if (array_json.size() < 2 || array_json.front() != '[' || array_json.back() != ']') return out;
+
+    size_t i = 1;
+    while (i + 1 < array_json.size()) {
+        while (i + 1 < array_json.size() &&
+               (std::isspace(static_cast<unsigned char>(array_json[i])) || array_json[i] == ',')) {
+            ++i;
+        }
+        if (i + 1 >= array_json.size() || array_json[i] == ']') break;
+        if (array_json[i] != '"') break;
+
+        ++i;
+        std::string value;
+        bool escaped = false;
+        while (i < array_json.size()) {
+            char c = array_json[i++];
+            if (escaped) {
+                switch (c) {
+                    case '"': value.push_back('"'); break;
+                    case '\\': value.push_back('\\'); break;
+                    case '/': value.push_back('/'); break;
+                    case 'b': value.push_back('\b'); break;
+                    case 'f': value.push_back('\f'); break;
+                    case 'n': value.push_back('\n'); break;
+                    case 'r': value.push_back('\r'); break;
+                    case 't': value.push_back('\t'); break;
+                    default: value.push_back(c); break;
+                }
+                escaped = false;
+                continue;
+            }
+            if (c == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (c == '"') {
+                out.push_back(value);
+                break;
+            }
+            value.push_back(c);
+        }
+    }
+
+    return out;
+}
+
+inline void parse_custom_vocabulary_options(const std::string& json,
+                                            std::vector<std::string>& custom_vocabulary,
+                                            float& vocabulary_boost) {
+    custom_vocabulary.clear();
+    vocabulary_boost = 5.0f;
+    if (json.empty()) return;
+
+    float parsed_boost = vocabulary_boost;
+    if (try_parse_json_float(json, "vocabulary_boost", parsed_boost)) {
+        vocabulary_boost = std::clamp(parsed_boost, 0.0f, 20.0f);
+    }
+
+    custom_vocabulary = parse_json_string_array_field(json, "custom_vocabulary");
+}
+
+inline std::unordered_map<uint32_t, float> build_token_bias_map(const std::vector<std::vector<uint32_t>>& tokenized_entries,
+                                                                float vocabulary_boost) {
+    std::unordered_map<uint32_t, float> vocab_bias;
+    const float clamped_boost = std::clamp(vocabulary_boost, 0.0f, 20.0f);
+    if (clamped_boost == 0.0f) return vocab_bias;
+
+    for (const auto& token_ids : tokenized_entries) {
+        for (uint32_t token_id : token_ids) {
+            float& entry = vocab_bias[token_id];
+            if (entry < clamped_boost) {
+                entry = clamped_boost;
+            }
+        }
+    }
+
+    return vocab_bias;
+}
+
+inline std::unordered_map<uint32_t, float> build_custom_vocabulary_bias(cactus::engine::Tokenizer* tokenizer,
+                                                                        const std::vector<std::string>& custom_vocabulary,
+                                                                        float vocabulary_boost) {
+    if (!tokenizer || custom_vocabulary.empty()) return {};
+    std::vector<std::vector<uint32_t>> tokenized_entries;
+    tokenized_entries.reserve(custom_vocabulary.size());
+
+    for (const auto& word : custom_vocabulary) {
+        if (word.empty()) continue;
+        tokenized_entries.push_back(tokenizer->encode(word));
+    }
+
+    return build_token_bias_map(tokenized_entries, vocabulary_boost);
+}
+
+inline void apply_custom_vocabulary_options(cactus::engine::Model* model, const std::string& json) {
+    if (!model) return;
+
+    std::vector<std::string> custom_vocabulary;
+    float vocabulary_boost = 5.0f;
+    parse_custom_vocabulary_options(json, custom_vocabulary, vocabulary_boost);
+    model->set_vocab_bias(build_custom_vocabulary_bias(model->get_tokenizer(), custom_vocabulary, vocabulary_boost));
+}
+
+inline void parse_options_json(const std::string& json,
+                               float& temperature, float& top_p,
+                               size_t& top_k, size_t& max_tokens,
+                               std::vector<std::string>& stop_sequences,
+                               bool& force_tools,
+                               size_t& tool_rag_top_k,
+                               float& confidence_threshold,
+                               bool& include_stop_sequences,
+                               bool& use_vad,
+                               bool& telemetry_enabled,
+                               bool* auto_handoff = nullptr,
+                               size_t* cloud_timeout_ms = nullptr,
+                               bool* handoff_with_images = nullptr) {
+    temperature = 0.0f;
+    top_p = 0.0f;
+    top_k = 0;
+    max_tokens = 100;
+    force_tools = false;
+    tool_rag_top_k = 2;
+    confidence_threshold = 0.7f;
+    include_stop_sequences = false;
+    use_vad = true;
+    telemetry_enabled = true;
+    if (auto_handoff) *auto_handoff = true;
+    if (cloud_timeout_ms) *cloud_timeout_ms = 15000;
+    if (handoff_with_images) *handoff_with_images = true;
+    stop_sequences.clear();
+
+    if (json.empty()) return;
+
+    size_t pos = json.find("\"temperature\"");
+    if (pos != std::string::npos) {
+        pos = json.find(':', pos) + 1;
+        temperature = std::stof(json.substr(pos));
+    }
+
+    pos = json.find("\"top_p\"");
+    if (pos != std::string::npos) {
+        pos = json.find(':', pos) + 1;
+        top_p = std::stof(json.substr(pos));
+    }
+
+    pos = json.find("\"top_k\"");
+    if (pos != std::string::npos) {
+        pos = json.find(':', pos) + 1;
+        top_k = std::stoul(json.substr(pos));
+    }
+
+    pos = json.find("\"max_tokens\"");
+    if (pos != std::string::npos) {
+        pos = json.find(':', pos) + 1;
+        max_tokens = std::stoul(json.substr(pos));
+    }
+
+    pos = json.find("\"force_tools\"");
+    if (pos != std::string::npos) {
+        pos = json.find(':', pos) + 1;
+        while (pos < json.length() && std::isspace(json[pos])) pos++;
+        force_tools = (json.substr(pos, 4) == "true");
+    }
+
+    pos = json.find("\"tool_rag_top_k\"");
+    if (pos != std::string::npos) {
+        pos = json.find(':', pos) + 1;
+        tool_rag_top_k = std::stoul(json.substr(pos));
+    }
+
+    pos = json.find("\"confidence_threshold\"");
+    if (pos != std::string::npos) {
+        pos = json.find(':', pos) + 1;
+        confidence_threshold = std::stof(json.substr(pos));
+    }
+
+    pos = json.find("\"include_stop_sequences\"");
+    if (pos != std::string::npos) {
+        pos = json.find(':', pos) + 1;
+        while (pos < json.length() && std::isspace(json[pos])) pos++;
+        include_stop_sequences = (json.substr(pos, 4) == "true");
+    }
+
+    pos = json.find("\"use_vad\"");
+    if (pos != std::string::npos) {
+        pos = json.find(':', pos) + 1;
+        while (pos < json.length() && std::isspace(json[pos])) pos++;
+        use_vad = (json.substr(pos, 4) == "true");
+    }
+
+    pos = json.find("\"telemetry_enabled\"");
+    if (pos != std::string::npos) {
+        pos = json.find(':', pos) + 1;
+        while (pos < json.length() && std::isspace(json[pos])) pos++;
+        telemetry_enabled = (json.substr(pos, 4) == "true");
+    }
+
+    if (auto_handoff) {
+        pos = json.find("\"auto_handoff\"");
+        if (pos != std::string::npos) {
+            pos = json.find(':', pos) + 1;
+            while (pos < json.length() && std::isspace(json[pos])) pos++;
+            *auto_handoff = (json.substr(pos, 4) == "true");
+        }
+    }
+
+    if (cloud_timeout_ms) {
+        pos = json.find("\"cloud_timeout_ms\"");
+        if (pos != std::string::npos) {
+            pos = json.find(':', pos) + 1;
+            *cloud_timeout_ms = std::stoul(json.substr(pos));
+        }
+    }
+
+    if (handoff_with_images) {
+        pos = json.find("\"handoff_with_images\"");
+        if (pos != std::string::npos) {
+            pos = json.find(':', pos) + 1;
+            while (pos < json.length() && std::isspace(json[pos])) pos++;
+            *handoff_with_images = (json.substr(pos, 4) == "true");
+        }
+    }
+
+    pos = json.find("\"stop_sequences\"");
+    if (pos != std::string::npos) {
+        pos = json.find('[', pos);
+        if (pos != std::string::npos) {
+            size_t end_pos = json.find(']', pos);
+            size_t seq_pos = json.find('"', pos);
+
+            while (seq_pos != std::string::npos && seq_pos < end_pos) {
+                size_t seq_start = seq_pos + 1;
+                size_t seq_end = json.find('"', seq_start);
+                if (seq_end != std::string::npos) {
+                    stop_sequences.push_back(json.substr(seq_start, seq_end - seq_start));
+                }
+                seq_pos = json.find('"', seq_end + 1);
+            }
+        }
+    }
+}
+
+static inline std::string trim_lfm2_slice(const std::string& value, size_t begin, size_t end) {
+    return trim_string(value.substr(begin, end - begin));
+}
+
+static inline void append_lfm2_call(const std::string& entry,
+                                   std::vector<std::string>& function_calls) {
+    if (entry.empty()) return;
+
+    std::string trimmed_entry = trim_lfm2_slice(entry, 0, entry.size());
+    if (trimmed_entry.empty()) return;
+
+    size_t paren_pos = trimmed_entry.find('(');
+    if (paren_pos == std::string::npos) return;
+
+    std::string func_name = trim_lfm2_slice(trimmed_entry, 0, paren_pos);
+    std::string args_str = trim_lfm2_slice(trimmed_entry, paren_pos + 1, trimmed_entry.size());
+
+    if (!args_str.empty() && args_str.back() == ')') {
+        args_str.pop_back();
+        args_str = trim_lfm2_slice(args_str, 0, args_str.size());
+    }
+
+    std::string json_call = "{\"name\":\"" + func_name + "\",\"arguments\":{";
+
+    size_t arg_pos = 0;
+    bool first_arg = true;
+    while (arg_pos < args_str.length()) {
+        while (arg_pos < args_str.length() && std::isspace(static_cast<unsigned char>(args_str[arg_pos]))) {
+            arg_pos++;
+        }
+
+        size_t eq_pos = args_str.find('=', arg_pos);
+        if (eq_pos == std::string::npos) break;
+
+        std::string arg_name = args_str.substr(arg_pos, eq_pos - arg_pos);
+
+        size_t val_start = eq_pos + 1;
+        size_t val_end = val_start;
+
+        if (val_start < args_str.length() && args_str[val_start] == '"') {
+            val_start++;
+            val_end = args_str.find('"', val_start);
+            if (val_end == std::string::npos) break;
+        } else {
+            val_end = args_str.find(',', val_start);
+            if (val_end == std::string::npos) val_end = args_str.length();
+        }
+
+        std::string arg_value = args_str.substr(val_start, val_end - val_start);
+
+        if (!first_arg) json_call += ",";
+        json_call += "\"" + arg_name + "\":\"" + arg_value + "\"";
+        first_arg = false;
+
+        arg_pos = args_str.find(',', val_end);
+        if (arg_pos != std::string::npos) {
+            arg_pos++;
+        } else {
+            break;
+        }
+    }
+
+    json_call += "}}";
+    function_calls.push_back(json_call);
+}
+
+inline void parse_function_calls_from_response(const std::string& response_text,
+                                               std::string& regular_response,
+                                               std::vector<std::string>& function_calls) {
+    regular_response = response_text;
+    function_calls.clear();
+
+    gemma::parse_function_calls(regular_response, function_calls);
+
+    // Parse Qwen-style function calls: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+    const std::string QWEN_TOOL_START = "<tool_call>";
+    const std::string QWEN_TOOL_END = "</tool_call>";
+    size_t qwen_start_pos = 0;
+
+    while ((qwen_start_pos = regular_response.find(QWEN_TOOL_START, qwen_start_pos)) != std::string::npos) {
+        size_t content_start = qwen_start_pos + QWEN_TOOL_START.length();
+        size_t qwen_end_pos = regular_response.find(QWEN_TOOL_END, content_start);
+
+        if (qwen_end_pos != std::string::npos) {
+            std::string json_content = regular_response.substr(content_start, qwen_end_pos - content_start);
+
+            size_t first = json_content.find_first_not_of(" \t\n\r");
+            size_t last = json_content.find_last_not_of(" \t\n\r");
+            if (first != std::string::npos && last != std::string::npos) {
+                json_content = json_content.substr(first, last - first + 1);
+            }
+
+            if (json_content.size() > 2 && json_content[0] == '{' &&
+                json_content.find("\"name\"") != std::string::npos) {
+                function_calls.push_back(json_content);
+            }
+
+            regular_response.erase(qwen_start_pos, qwen_end_pos + QWEN_TOOL_END.length() - qwen_start_pos);
+        } else {
+            break;
+        }
+    }
+    
+    // Parse LFM2-style function calls: <|tool_call_start|>[name(args)]<|tool_call_end|>
+    const std::string TOOL_CALL_START = "<|tool_call_start|>";
+    const std::string TOOL_CALL_END = "<|tool_call_end|>";
+    size_t tool_start_pos = 0;
+
+    while ((tool_start_pos = regular_response.find(TOOL_CALL_START, tool_start_pos)) != std::string::npos) {
+        size_t content_start = tool_start_pos + TOOL_CALL_START.length();
+        size_t tool_end_pos = regular_response.find(TOOL_CALL_END, content_start);
+
+        if (tool_end_pos != std::string::npos) {
+            std::string tool_content = regular_response.substr(content_start, tool_end_pos - content_start);
+            std::string content = tool_content;
+            size_t trim_start = 0;
+            while (trim_start < content.size() && std::isspace(static_cast<unsigned char>(content[trim_start]))) {
+                trim_start++;
+            }
+
+            if (trim_start < content.size()) {
+                size_t trim_end = content.size() - 1;
+                while (trim_end > trim_start && std::isspace(static_cast<unsigned char>(content[trim_end]))) {
+                    trim_end--;
+                }
+                content = content.substr(trim_start, trim_end - trim_start + 1);
+            } else {
+                content.clear();
+            }
+
+            if (!content.empty() && content.front() == '[' && content.back() == ']') {
+                std::string inner = content.substr(1, content.size() - 2);
+
+                size_t inner_first = inner.find_first_not_of(" \t\n\r");
+                if (inner_first != std::string::npos && inner[inner_first] == '{') {
+                    size_t pos = inner_first;
+                    while (pos < inner.size()) {
+                        if (inner[pos] == '{') {
+                            int brace_depth = 1;
+                            size_t obj_start = pos;
+                            pos++;
+                            while (pos < inner.size() && brace_depth > 0) {
+                                if (inner[pos] == '{') brace_depth++;
+                                else if (inner[pos] == '}') brace_depth--;
+                                pos++;
+                            }
+                            if (brace_depth == 0) {
+                                std::string json_obj = inner.substr(obj_start, pos - obj_start);
+                                if (json_obj.find("\"name\"") != std::string::npos) {
+                                    function_calls.push_back(json_obj);
+                                }
+                            }
+                        } else {
+                            pos++;
+                        }
+                    }
+                } else {
+                    size_t start = 0;
+                    int paren_depth = 0;
+
+                    for (size_t i = 0; i < inner.size(); ++i) {
+                        char c = inner[i];
+                        if (c == '(') {
+                            paren_depth++;
+                        } else if (c == ')' && paren_depth > 0) {
+                            paren_depth--;
+                        } else if (c == ',' && paren_depth == 0) {
+                            append_lfm2_call(inner.substr(start, i - start), function_calls);
+                            start = i + 1;
+                        }
+                    }
+
+                    if (start < inner.size()) {
+                        append_lfm2_call(inner.substr(start), function_calls);
+                    }
+                }
+            } else if (!content.empty()) {
+                append_lfm2_call(content, function_calls);
+            }
+
+            regular_response.erase(tool_start_pos, tool_end_pos + TOOL_CALL_END.length() - tool_start_pos);
+        } else {
+            break;
+        }
+    }
+
+    const char* FUNCTION_CALL_MARKER = "\"function_call\"";
+    size_t search_pos = 0;
+    const size_t text_len = regular_response.length();
+
+    while (search_pos < text_len) {
+        size_t marker_pos = regular_response.find(FUNCTION_CALL_MARKER, search_pos);
+        if (marker_pos == std::string::npos) break;
+
+        size_t json_start = regular_response.find('{', marker_pos);
+        if (json_start == std::string::npos) break;
+
+        int brace_count = 1;
+        size_t json_end = json_start + 1;
+        while (json_end < text_len && brace_count > 0) {
+            char c = regular_response[json_end];
+            brace_count += (c == '{') - (c == '}');
+            json_end++;
+        }
+
+        if (brace_count == 0) {
+            function_calls.push_back(regular_response.substr(json_start, json_end - json_start));
+            regular_response = regular_response.substr(0, marker_pos);
+            size_t last_bracket = regular_response.rfind('{');
+            if(last_bracket != std::string::npos) {
+                regular_response = regular_response.substr(0, last_bracket);
+            }
+        }
+        search_pos = json_end;
+    }
+}
+
+inline std::string construct_response_json(const std::string& regular_response,
+                                           const std::vector<std::string>& function_calls,
+                                           double time_to_first_token,
+                                           double total_time_ms,
+                                           double prefill_tps,
+                                           double decode_tps,
+                                           size_t prompt_tokens,
+                                           size_t completion_tokens,
+                                           float confidence = 0.0f,
+                                           bool cloud_handoff = false) {
+    std::ostringstream json;
+    json << "{";
+    json << "\"success\":true,";
+    json << "\"error\":null,";
+    json << "\"cloud_handoff\":" << (cloud_handoff ? "true" : "false") << ",";
+    json << "\"response\":\"" << escape_json_string(regular_response) << "\",";
+    json << "\"function_calls\":[";
+    for (size_t i = 0; i < function_calls.size(); ++i) {
+        if (i > 0) json << ",";
+        json << function_calls[i];
+    }
+    json << "],";
+    json << "\"confidence\":" << std::fixed << std::setprecision(4) << confidence << ",";
+    json << "\"time_to_first_token_ms\":" << std::fixed << std::setprecision(2) << time_to_first_token << ",";
+    json << "\"total_time_ms\":" << std::fixed << std::setprecision(2) << total_time_ms << ",";
+    json << "\"prefill_tps\":" << std::fixed << std::setprecision(2) << prefill_tps << ",";
+    json << "\"decode_tps\":" << std::fixed << std::setprecision(2) << decode_tps << ",";
+    json << "\"ram_usage_mb\":" << std::fixed << std::setprecision(2) << get_ram_usage_mb() << ",";
+    json << "\"prefill_tokens\":" << prompt_tokens << ",";
+    json << "\"decode_tokens\":" << completion_tokens << ",";
+    json << "\"total_tokens\":" << (prompt_tokens + completion_tokens);
+    json << "}";
+    return json.str();
+}
+
+inline std::string serialize_function_calls(const std::vector<std::string>& calls) {
+    if (calls.empty()) return "[]";
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < calls.size(); ++i) {
+        if (i > 0) oss << ",";
+        oss << calls[i];
+    }
+    oss << "]";
+    return oss.str();
+}
+
+} // namespace ffi
+} // namespace cactus
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+const char* cactus_get_last_error();
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // CACTUS_UTILS_H
