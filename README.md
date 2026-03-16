@@ -311,3 +311,13 @@ If you use Cactus in your research, please cite it as follows:
 
 [blog-shield]: https://img.shields.io/badge/Blog-555?style=for-the-badge&logo=hashnode&logoColor=white
 [blog-url]: https://cactus-compute.github.io/cactus/blog/
+
+## Quick install (Android / Termux)
+
+Download runtime:
+
+wget https://github.com/drive-art/cactus-runtime/releases/download/v1/libcactus.so
+
+or
+
+curl -L -o libcactus.so https://github.com/drive-art/cactus-runtime/releases/download/v1/libcactus.so
