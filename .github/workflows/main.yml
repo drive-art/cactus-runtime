@@ -12,21 +12,19 @@ jobs:
 
       - name: Install deps
         run: |
-          sudo apt-get install -y cmake build-essential python3 python3-pip python3-venv git
+          sudo apt-get install -y cmake build-essential python3 python3-pip python3-venv git libcurl4-openssl-dev
 
       - name: Setup and build
         run: |
           cd cactus
           source ./setup
-          CACTUS_TARGET=linux cactus build --python
+          cactus build --python
 
       - name: Find library
-        run: find cactus -name "*.so" -o -name "*.dylib" | head -20
+        run: find cactus -name "*.so" | head -20
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: libcactus-python-linux-x86
-          path: |
-            cactus/build/**/*.so
-            cactus/python/**/*.so
+          name: libcactus-python-arm64
+          path: cactus/build/**/*.so
