@@ -7,20 +7,26 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Install deps
-        run: sudo apt-get install -y cmake build-essential python3
-
       - name: Clone Cactus
         run: git clone https://github.com/cactus-compute/cactus
 
-      - name: Build Python FFI
+      - name: Install deps
+        run: |
+          sudo apt-get install -y cmake build-essential python3 python3-pip python3-venv git
+
+      - name: Setup and build
         run: |
           cd cactus
           source ./setup
-          cactus build --python
+          CACTUS_TARGET=linux cactus build --python
 
-      - name: Find and upload library
+      - name: Find library
+        run: find cactus -name "*.so" -o -name "*.dylib" | head -20
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: libcactus-python-ffi
-          path: cactus/build/**/*.so
+          name: libcactus-python-linux-x86
+          path: |
+            cactus/build/**/*.so
+            cactus/python/**/*.so
