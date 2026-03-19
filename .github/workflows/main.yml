@@ -28,4 +28,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: libcactus-python-arm64
-          path: cactus/build/**/*.so
+          path: cactus/cactus/build/libcactus.so
