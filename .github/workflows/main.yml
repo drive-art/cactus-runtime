@@ -21,13 +21,19 @@ jobs:
       - name: Clone Cactus
         run: git clone https://github.com/cactus-compute/cactus
 
-      - name: Patch telemetry to remove curl dependency
+      - name: Replace telemetry with stub
         run: |
-          cd cactus/cactus
-          # Заменяем include curl на заглушку
-          sed -i 's/#include <curl\/curl.h>/\/\/ curl disabled for Android/' telemetry/telemetry.cpp
-          # Проверяем
-          grep -n "curl" telemetry/telemetry.cpp | head -5
+          cat > cactus/cactus/telemetry/telemetry.cpp << 'STUB'
+          #include "telemetry.h"
+          namespace cactus { namespace telemetry {
+            void set_environment(const char*) {}
+            void set_app_id(const char*) {}
+            void flush() {}
+            void shutdown() {}
+            void record_event(const char*, const char*) {}
+          }}
+          STUB
+          echo "✅ telemetry stub created"
 
       - name: Build for Android ARM64
         run: |
