@@ -10,27 +10,34 @@ jobs:
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential python3 python3-pip python3-venv git unzip wget
+          sudo apt-get install -y cmake build-essential python3 git unzip wget
 
-      - name: Install Android NDK r26d
+      - name: Install Android NDK
         run: |
           wget -q "https://dl.google.com/android/repository/android-ndk-r26d-linux.zip"
           unzip -q android-ndk-r26d-linux.zip
-          # На ARM сервере нужен aarch64 toolchain
-          NDK_PATH="$PWD/android-ndk-r26d"
-          ln -sf "$NDK_PATH/toolchains/llvm/prebuilt/linux-aarch64" "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64" 2>/dev/null || true
-          echo "NDK=$NDK_PATH" >> $GITHUB_ENV
+          ls android-ndk-r26d/toolchains/llvm/prebuilt/
+          echo "NDK=$PWD/android-ndk-r26d" >> $GITHUB_ENV
+
+      - name: Clone Cactus
+        run: git clone https://github.com/cactus-compute/cactus
+
+      - name: Find CMakeLists
+        run: find cactus -name "CMakeLists.txt" | head -5
+
       - name: Build for Android ARM64
         run: |
           cd cactus/cactus
           mkdir -p build_android && cd build_android
+          TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/linux-aarch64
           cmake .. \
             -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-26 \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
-            -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--exclude-libs,ALL"
+            -DCMAKE_C_COMPILER=$TOOLCHAIN/bin/aarch64-linux-android26-clang \
+            -DCMAKE_CXX_COMPILER=$TOOLCHAIN/bin/aarch64-linux-android26-clang++
           make -j4
 
       - name: Find library
@@ -40,4 +47,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: libcactus-android-arm64
-          path: cactus/cactus/cactus/build_android/**/*.so
+          path: cactus/cactus/build_android/**/*.so
