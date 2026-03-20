@@ -14,13 +14,12 @@ jobs:
 
       - name: Install Android NDK r26d
         run: |
-          wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
+          wget -q "https://dl.google.com/android/repository/android-ndk-r26d-linux.zip"
           unzip -q android-ndk-r26d-linux.zip
-          echo "NDK=$PWD/android-ndk-r26d" >> $GITHUB_ENV
-
-      - name: Clone Cactus
-        run: git clone https://github.com/cactus-compute/cactus
-
+          # На ARM сервере нужен aarch64 toolchain
+          NDK_PATH="$PWD/android-ndk-r26d"
+          ln -sf "$NDK_PATH/toolchains/llvm/prebuilt/linux-aarch64" "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64" 2>/dev/null || true
+          echo "NDK=$NDK_PATH" >> $GITHUB_ENV
       - name: Build for Android ARM64
         run: |
           cd cactus/cactus
