@@ -5,39 +5,32 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-latest
     steps:
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential python3 git unzip wget
+          sudo apt-get install -y cmake build-essential python3 git unzip wget libcurl4-openssl-dev
 
-      - name: Install Android NDK
+      - name: Install Android NDK r26d
         run: |
           wget -q "https://dl.google.com/android/repository/android-ndk-r26d-linux.zip"
           unzip -q android-ndk-r26d-linux.zip
-          ls android-ndk-r26d/toolchains/llvm/prebuilt/
           echo "NDK=$PWD/android-ndk-r26d" >> $GITHUB_ENV
 
       - name: Clone Cactus
         run: git clone https://github.com/cactus-compute/cactus
 
-      - name: Find CMakeLists
-        run: find cactus -name "CMakeLists.txt" | head -5
-
       - name: Build for Android ARM64
         run: |
           cd cactus/cactus
           mkdir -p build_android && cd build_android
-          TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/linux-aarch64
           cmake .. \
             -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-26 \
             -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=ON \
-            -DCMAKE_C_COMPILER=$TOOLCHAIN/bin/aarch64-linux-android26-clang \
-            -DCMAKE_CXX_COMPILER=$TOOLCHAIN/bin/aarch64-linux-android26-clang++
+            -DBUILD_SHARED_LIBS=ON
           make -j4
 
       - name: Find library
