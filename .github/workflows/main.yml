@@ -1,4 +1,4 @@
-name: Build Cactus v1 — All Devices
+name: Build Cactus — Poco F1
 
 on:
   workflow_dispatch:
@@ -6,28 +6,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - device: honor90
-            march: "armv8.2-a+fp16+simd+dotprod"
-            artifact: "libcactus-honor90.so"
-          - device: poco-x3pro
-            march: "armv8.2-a+dotprod"
-            artifact: "libcactus-poco-x3pro.so"
-          - device: poco-f1
-            march: "armv8-a"
-            artifact: "libcactus-poco-f1.so"
-          - device: asus-zb631kl
-            march: "armv8-a"
-            artifact: "libcactus-asus-zb631kl.so"
-
-    name: ${{ matrix.device }}
+    name: poco-f1
 
     steps:
-      - name: Checkout Cactus v1 source
+      - name: Checkout Cactus
         uses: actions/checkout@v4
         with:
           repository: cactus-compute/cactus
@@ -39,29 +21,23 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y cmake ninja-build wget unzip
 
-      - name: Download Android NDK r26d
+      - name: Download NDK r26d
         run: |
           wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
           unzip -q android-ndk-r26d-linux.zip
           echo "NDK_PATH=$(pwd)/android-ndk-r26d" >> $GITHUB_ENV
 
-      - name: Show telemetry files
+      - name: Show structure
         run: |
-          find cactus-src -name "telemetry*" | head -20
-          echo "---"
+          find cactus-src -name "telemetry*"
           find cactus-src/android -type f | head -20
 
       - name: Patch telemetry
         run: |
           TELEM=$(find cactus-src -name "telemetry.cpp" | head -1)
           HEADER=$(find cactus-src -name "telemetry.h" | head -1)
-          echo "telemetry.cpp: $TELEM"
-          echo "telemetry.h: $HEADER"
-          if [ -n "$HEADER" ]; then
-            echo "=== telemetry.h ===" && cat "$HEADER"
-          fi
-          if [ -n "$TELEM" ]; then
-            cat > "$TELEM" << 'STUB'
+          cat "$HEADER"
+          cat > "$TELEM" << 'STUB'
 #include "telemetry.h"
 #include <string>
 namespace cactus { namespace telemetry {
@@ -81,13 +57,12 @@ namespace cactus { namespace telemetry {
   void cacheCloudApiKey(const char*) {}
 }}
 STUB
-            echo "✅ patched"
-          fi
+          echo "✅ patched"
 
       - name: Configure CMake
         run: |
-          mkdir -p build-${{ matrix.device }}
-          cd build-${{ matrix.device }}
+          mkdir -p build-poco-f1
+          cd build-poco-f1
           cmake ../cactus-src/android \
             -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="${NDK_PATH}/build/cmake/android.toolchain.cmake" \
@@ -95,24 +70,19 @@ STUB
             -DANDROID_PLATFORM=android-26 \
             -DANDROID_STL=c++_shared \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_FLAGS="-march=${{ matrix.march }} -O3 -ffast-math" \
-            -DCMAKE_C_FLAGS="-march=${{ matrix.march }} -O3 -ffast-math"
+            -DCMAKE_CXX_FLAGS="-march=armv8-a -O3" \
+            -DCMAKE_C_FLAGS="-march=armv8-a -O3"
 
       - name: Build
         run: |
-          cd build-${{ matrix.device }}
+          cd build-poco-f1
           ninja -j$(nproc)
+          find . -name "*.so" | grep -v stl
 
-      - name: Find and upload
-        run: |
-          SO=$(find build-${{ matrix.device }} -name "*.so" | grep -v "stl\|c++_shared" | head -1)
-          echo "Found SO: $SO"
-          ls -lh "$SO"
-          cp "$SO" "${{ matrix.artifact }}"
-
-      - name: Upload artifact
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          name: libcactus-poco-f1
+          path: build-poco-f1/**/*.so
           retention-days: 30
+          
