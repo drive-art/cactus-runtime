@@ -1,15 +1,18 @@
-name: Build Cactus — Poco F1
+name: Build Cactus v1 - Poco F1
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/main.yml"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    name: poco-f1
+    name: cactus-v1-poco-f1
 
     steps:
-      - name: Checkout Cactus
+      - name: Checkout Cactus v1
         uses: actions/checkout@v4
         with:
           repository: cactus-compute/cactus
@@ -19,78 +22,68 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y cmake ninja-build wget unzip
+          sudo apt-get install -y cmake ninja-build wget unzip python3
 
-      - name: Download NDK r26d
+      - name: Cache Android NDK
+        uses: actions/cache@v4
+        with:
+          path: android-ndk-r26d
+          key: ndk-r26d
+
+      - name: Download NDK (if not cached)
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
           unzip -q android-ndk-r26d-linux.zip
-          echo "NDK_PATH=$(pwd)/android-ndk-r26d" >> $GITHUB_ENV
 
-      - name: Patch march flag in CMakeLists
+      - name: Set NDK path
+        run: echo "NDK_PATH=$(pwd)/android-ndk-r26d" >> $GITHUB_ENV
+
+      # ⚠️ минимальный patch (если telemetry всё ещё есть)
+      - name: Patch telemetry (safe stub)
         run: |
-          CMAKE=$(find cactus-src/android -name "CMakeLists.txt" | head -1)
-          echo "=== Before patch ===" && grep -n "march" "$CMAKE" || echo "no march found"
-          sed -i 's/-march=armv8\.2-a+fp16+simd+dotprod/-march=armv8-a/g' "$CMAKE"
-          sed -i 's/-march=armv8\.4-a[^ ]*/-march=armv8-a/g' "$CMAKE"
-          echo "=== After patch ===" && grep -n "march" "$CMAKE" || echo "no march found"
-
-      - name: Patch telemetry
-        run: |
-          TELEM=$(find cactus-src -name "telemetry.cpp" | head -1)
-          HEADER=$(find cactus-src -name "telemetry.h" | head -1)
-          echo "=== telemetry.h ===" && cat "$HEADER"
-          python3 - << 'PYEOF'
-import re, sys
-
-stub = '''#include "telemetry.h"
+          FILE=$(find cactus-src -name "telemetry.cpp" | head -1 || true)
+          if [ -n "$FILE" ]; then
+            cat > "$FILE" << 'EOF'
 #include <string>
 namespace cactus { namespace telemetry {
-  void setTelemetryEnvironment(const char*, const char*, const char*) {}
-  void setAppId(const char*) {}
-  void setCloudKey(const char*) {}
-  void setCloudDisabled(bool) {}
-  void setStreamMode(bool) {}
-  void init(const char*, const char*, const char*) {}
-  void recordInit(const char*, bool, double, const char*) {}
-  void recordCompletion(const char*, const CompletionMetrics&) {}
-  void recordTranscription(const char*, bool, double, double, double, int, double, const char*) {}
-  void recordStreamTranscription(const char*, bool, double, double, double, int, double, double, double, int, const char*) {}
-  void flush() {}
+  void init(...) {}
   void shutdown() {}
-  std::string loadCachedCloudApiKey() { return ""; }
-  void cacheCloudApiKey(const char*) {}
 }}
-'''
+EOF
+            echo "Telemetry patched"
+          else
+            echo "Telemetry not found (v1 OK)"
+          fi
 
-import subprocess
-telem = subprocess.check_output(['find', 'cactus-src', '-name', 'telemetry.cpp']).decode().strip().split('\n')[0]
-with open(telem, 'w') as f:
-    f.write(stub)
-print(f"Patched: {telem}")
-PYEOF
-
-      - name: Configure CMake
+      - name: Configure CMake (v1)
         run: |
-          mkdir -p build-poco-f1
-          cd build-poco-f1
+          mkdir -p build
+          cd build
           cmake ../cactus-src/android \
             -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="${NDK_PATH}/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-26 \
             -DANDROID_STL=c++_shared \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-march=armv8-a -O3" \
+            -DCMAKE_CXX_FLAGS="-march=armv8-a -O3"
 
       - name: Build
         run: |
-          cd build-poco-f1
+          cd build
           ninja -j$(nproc)
-          find . -name "*.so" | grep -v "stl\|c++_shared"
+          find . -name "*.so"
+
+      - name: Strip binary (уменьшаем размер)
+        run: |
+          ${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip \
+          build/**/*.so || true
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: libcactus-poco-f1
-          path: build-poco-f1/**/*.so
+          name: libcactus-v1-poco-f1
+          path: build/**/*.so
           retention-days: 30
