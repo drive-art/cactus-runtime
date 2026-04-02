@@ -1,4 +1,4 @@
-name: Build Cactus v1 All Devices
+name: Build Cactus v1 - Poco F1 Only
 
 on:
   workflow_dispatch:
@@ -7,55 +7,51 @@ on:
       - main
 
 jobs:
-  build:
+  build-poco-f1:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        device: [honor90, poco-x3pro, poco-f1, asus-zb631kl]
-        include:
-          - device: honor90
-            march: "armv8.4-a+dotprod+fp16"
-          - device: poco-x3pro
-            march: "armv8.2-a+dotprod+fp16"
-          - device: poco-f1
-            march: "armv8-a"
-          - device: asus-zb631kl
-            march: "armv8-a"
+    name: Poco F1 (Snapdragon 845)
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Cactus
+        uses: actions/checkout@v4
         with:
           repository: cactus-compute/cactus
           ref: main
           path: cactus-src
 
-      - run: |
+      - name: Install dependencies
+        run: |
           sudo apt-get update -qq
-          sudo apt-get install -y cmake ninja-build python3 wget unzip
+          sudo apt-get install -y cmake ninja-build wget unzip
 
-      - run: |
+      - name: Download NDK r26d
+        run: |
           wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
           unzip -q android-ndk-r26d-linux.zip
           echo "NDK_PATH=$(pwd)/android-ndk-r26d" >> $GITHUB_ENV
 
-      - run: |
+      - name: Build for Poco F1
+        run: |
           cd cactus-src
-          mkdir -p build-${{ matrix.device }}
-          cd build-${{ matrix.device }}
+          mkdir -p build-poco-f1
+          cd build-poco-f1
           cmake ../android -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="${NDK_PATH}/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-26 \
-            -DCMAKE_CXX_FLAGS="-march=${{ matrix.march }} -O3" \
-            -DCMAKE_C_FLAGS="-march=${{ matrix.march }} -O3"
+            -DCMAKE_CXX_FLAGS="-march=armv8-a -O3" \
+            -DCMAKE_C_FLAGS="-march=armv8-a -O3"
           ninja -j$(nproc)
 
-      - run: |
-          SO=$(find cactus-src/build-${{ matrix.device }} -name "*.so" | head -1)
-          cp "$SO" "libcactus-${{ matrix.device }}.so"
+      - name: Upload Poco F1
+        run: |
+          SO=$(find cactus-src/build-poco-f1 -name "*.so" | head -1)
+          cp "$SO" "libcactus-poco-f1.so"
+          ls -lh libcactus-poco-f1.so
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: libcactus-${{ matrix.device }}
-          path: libcactus-${{ matrix.device }}.so
+          name: libcactus-poco-f1
+          path: libcactus-poco-f1.so
           retention-days: 30
