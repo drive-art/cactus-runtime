@@ -5,6 +5,7 @@ on:
   push:
     paths:
       - ".github/workflows/main.yml"
+      - "scripts/**"
 
 jobs:
   build:
@@ -12,26 +13,30 @@ jobs:
     name: cactus-v1-poco-f1
 
     steps:
-      - name: Checkout Cactus v1
+      - name: Checkout repo (self)
+        uses: actions/checkout@v4
+
+      - name: Checkout Cactus
         uses: actions/checkout@v4
         with:
           repository: cactus-compute/cactus
           ref: main
           path: cactus-src
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y cmake ninja-build wget unzip python3
 
-      - name: Cache Android NDK
+      - name: Cache NDK
+        id: cache-ndk
         uses: actions/cache@v4
         with:
           path: android-ndk-r26d
           key: ndk-r26d
 
-      - name: Download NDK (if not cached)
-        if: steps.cache.outputs.cache-hit != 'true'
+      - name: Download NDK
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
           wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
           unzip -q android-ndk-r26d-linux.zip
@@ -39,24 +44,10 @@ jobs:
       - name: Set NDK path
         run: echo "NDK_PATH=$(pwd)/android-ndk-r26d" >> $GITHUB_ENV
 
-      # ⚠️ минимальный patch (если telemetry всё ещё есть)
-      - name: Patch telemetry (safe stub)
-        run: |
-          FILE=$(find cactus-src -name "telemetry.cpp" | head -1 || true)
-          if [ -n "$FILE" ]; then
-            cat > "$FILE" << 'EOF'
-#include <string>
-namespace cactus { namespace telemetry {
-  void init(...) {}
-  void shutdown() {}
-}}
-EOF
-            echo "Telemetry patched"
-          else
-            echo "Telemetry not found (v1 OK)"
-          fi
+      - name: Patch telemetry (safe)
+        run: python3 scripts/patch_telemetry.py
 
-      - name: Configure CMake (v1)
+      - name: Configure
         run: |
           mkdir -p build
           cd build
@@ -74,12 +65,13 @@ EOF
         run: |
           cd build
           ninja -j$(nproc)
-          find . -name "*.so"
 
-      - name: Strip binary (уменьшаем размер)
+      - name: Strip
         run: |
-          ${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip \
-          build/**/*.so || true
+          ${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip build/**/*.so || true
+
+      - name: Show artifacts
+        run: find build -name "*.so"
 
       - name: Upload
         uses: actions/upload-artifact@v4
