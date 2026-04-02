@@ -1,42 +1,61 @@
-- name: Patch telemetry (FULL FIX)
-  run: |
-    FILE=$(find cactus-src -name "telemetry.cpp" | head -1 || true)
+name: Build Cactus v1 All Devices
 
-    if [ -z "$FILE" ]; then
-      echo "no telemetry (ok)"
-      exit 0
-    fi
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
 
-    cat > $FILE << 'EOF'
-#include "telemetry.h"
-#include <string>
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        device: [honor90, poco-x3pro, poco-f1, asus-zb631kl]
+        include:
+          - device: honor90
+            march: "armv8.4-a+dotprod+fp16"
+          - device: poco-x3pro
+            march: "armv8.2-a+dotprod+fp16"
+          - device: poco-f1
+            march: "armv8-a"
+          - device: asus-zb631kl
+            march: "armv8-a"
 
-namespace cactus { namespace telemetry {
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: cactus-compute/cactus
+          ref: main
+          path: cactus-src
 
-void setTelemetryEnvironment(const char*, const char*, const char*) {}
-void setAppId(const char*) {}
-void setCloudKey(const char*) {}
-void setCloudDisabled(bool) {}
-void setStreamMode(bool) {}
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake ninja-build python3 wget unzip
 
-void init(const char*, const char*, const char*) {}
-void recordInit(const char*, bool, double, const char*) {}
+      - run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
+          unzip -q android-ndk-r26d-linux.zip
+          echo "NDK_PATH=$(pwd)/android-ndk-r26d" >> $GITHUB_ENV
 
-struct CompletionMetrics {};
+      - run: |
+          cd cactus-src
+          mkdir -p build-${{ matrix.device }}
+          cd build-${{ matrix.device }}
+          cmake ../android -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${NDK_PATH}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_CXX_FLAGS="-march=${{ matrix.march }} -O3" \
+            -DCMAKE_C_FLAGS="-march=${{ matrix.march }} -O3"
+          ninja -j$(nproc)
 
-void recordCompletion(const char*, const CompletionMetrics&) {}
+      - run: |
+          SO=$(find cactus-src/build-${{ matrix.device }} -name "*.so" | head -1)
+          cp "$SO" "libcactus-${{ matrix.device }}.so"
 
-void recordTranscription(const char*, bool, double, double, double, int, double, const char*) {}
-
-void recordStreamTranscription(const char*, bool, double, double, double, int, double, double, double, int, const char*) {}
-
-void flush() {}
-void shutdown() {}
-
-std::string loadCachedCloudApiKey() { return ""; }
-void cacheCloudApiKey(const char*) {}
-
-}}
-EOF
-
-    echo "telemetry fully stubbed"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libcactus-${{ matrix.device }}
+          path: libcactus-${{ matrix.device }}.so
+          retention-days: 30
