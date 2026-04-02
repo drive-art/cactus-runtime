@@ -1,7 +1,12 @@
-name: Build Cactus — All Devices
+name: Build Cactus v1 — All Devices
 
 on:
   workflow_dispatch:
+    inputs:
+      cactus_version:
+        description: 'Cactus version (main for v1, or v0.x tag)'
+        default: 'main'
+        required: false
   push:
     branches:
       - main
@@ -15,62 +20,52 @@ jobs:
           - device: honor90
             chip: "Snapdragon 7 Gen1"
             march: "armv8.4-a+dotprod+fp16"
-            artifact: "libcactus-honor90.so"
 
           - device: poco-x3pro
             chip: "Snapdragon 860"
             march: "armv8.2-a+dotprod+fp16"
-            artifact: "libcactus-poco-x3pro.so"
 
           - device: poco-f1
             chip: "Snapdragon 845"
             march: "armv8-a"
-            artifact: "libcactus-poco-f1.so"
 
           - device: asus-zb631kl
             chip: "Snapdragon 660"
             march: "armv8-a"
-            artifact: "libcactus-asus-zb631kl.so"
 
-    name: Build for ${{ matrix.device }}
+    name: Build Cactus v1 for ${{ matrix.device }}
 
     steps:
-      - name: Checkout Cactus
+      - name: Checkout Cactus v1
         uses: actions/checkout@v4
         with:
           repository: cactus-compute/cactus
-          ref: main
+          ref: ${{ github.event.inputs.cactus_version || 'main' }}
           path: cactus-src
 
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y cmake ninja-build wget unzip
+          sudo apt-get install -y cmake ninja-build python3 python3-pip curl wget unzip
 
-      - name: Download NDK r26d
+      - name: Download Android NDK r26d
         run: |
           wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
           unzip -q android-ndk-r26d-linux.zip
           echo "NDK_PATH=$(pwd)/android-ndk-r26d" >> $GITHUB_ENV
 
-      - name: Patch telemetry
+      - name: Setup Cactus build environment
         run: |
-          TELEM=$(find cactus-src -name "telemetry.cpp" | head -1)
-          if [ -f "$TELEM" ]; then
-            echo "#include \"telemetry.h\"" > "$TELEM"
-            echo "namespace cactus { namespace telemetry {" >> "$TELEM"
-            echo "void init(const char*, const char*, const char*) {}" >> "$TELEM"
-            echo "void recordInit(const char*, bool, double, const char*) {}" >> "$TELEM"
-            echo "void recordCompletion(const char*, int, int, double, double, bool) {}" >> "$TELEM"
-            echo "void flush() {}" >> "$TELEM"
-            echo "void shutdown() {}" >> "$TELEM"
-            echo "}}" >> "$TELEM"
-          fi
+          cd cactus-src
+          source ./setup || echo "setup script not found, continuing..."
+          echo "✅ Cactus environment ready"
 
-      - name: Configure CMake
+      - name: Build for ${{ matrix.device }}
         run: |
-          mkdir -p cactus-src/build-${{ matrix.device }}
-          cd cactus-src/build-${{ matrix.device }}
+          cd cactus-src
+          mkdir -p build-${{ matrix.device }}
+          cd build-${{ matrix.device }}
+          
           cmake ../android \
             -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="${NDK_PATH}/build/cmake/android.toolchain.cmake" \
@@ -78,23 +73,40 @@ jobs:
             -DANDROID_PLATFORM=android-26 \
             -DANDROID_STL=c++_shared \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_FLAGS="-march=${{ matrix.march }} -O3" \
-            -DCMAKE_C_FLAGS="-march=${{ matrix.march }} -O3"
+            -DCMAKE_CXX_FLAGS="-march=${{ matrix.march }} -O3 -ffast-math -fno-exceptions" \
+            -DCMAKE_C_FLAGS="-march=${{ matrix.march }} -O3 -ffast-math" \
+            -DCACTUS_ANDROID=ON \
+            -DCACTUS_PYTHON=ON
+          
+          ninja -j$(nproc)
+          echo "✅ Build for ${{ matrix.device }} completed"
 
-      - name: Build
+      - name: Locate and verify output
         run: |
           cd cactus-src/build-${{ matrix.device }}
-          ninja -j$(nproc)
-
-      - name: Locate artifact
-        run: |
-          SO=$(find cactus-src/build-${{ matrix.device }} -name "*.so" | head -1)
-          cp "$SO" "${{ matrix.artifact }}"
-          ls -lh "${{ matrix.artifact }}"
+          
+          SO=$(find . -name "libcactus.so" -o -name "libcactus_android.so" | head -1)
+          if [ -z "$SO" ]; then
+            echo "❌ .so file not found!"
+            find . -name "*.so" -o -name "*.a" | head -20
+            exit 1
+          fi
+          
+          cp "$SO" "libcactus-${{ matrix.device }}.so"
+          ls -lh "libcactus-${{ matrix.device }}.so"
+          
+          file "libcactus-${{ matrix.device }}.so"
+          
+          if ! file "libcactus-${{ matrix.device }}.so" | grep -q "aarch64"; then
+            echo "❌ Wrong architecture!"
+            exit 1
+          fi
+          
+          echo "✅ Artifact verified: libcactus-${{ matrix.device }}.so"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          name: libcactus-${{ matrix.device }}
+          path: cactus-src/build-${{ matrix.device }}/libcactus-${{ matrix.device }}.so
           retention-days: 30
