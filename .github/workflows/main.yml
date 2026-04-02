@@ -1,4 +1,4 @@
-name: Build Cactus v0 — All Devices
+name: Build Cactus v1 — All Devices
 
 on:
   workflow_dispatch:
@@ -14,15 +14,12 @@ jobs:
           - device: honor90
             march: "armv8.2-a+fp16+simd+dotprod"
             artifact: "libcactus-honor90.so"
-
           - device: poco-x3pro
             march: "armv8.2-a+dotprod"
             artifact: "libcactus-poco-x3pro.so"
-
           - device: poco-f1
             march: "armv8-a"
             artifact: "libcactus-poco-f1.so"
-
           - device: asus-zb631kl
             march: "armv8-a"
             artifact: "libcactus-asus-zb631kl.so"
@@ -30,7 +27,7 @@ jobs:
     name: ${{ matrix.device }}
 
     steps:
-      - name: Checkout Cactus source
+      - name: Checkout Cactus v1 source
         uses: actions/checkout@v4
         with:
           repository: cactus-compute/cactus
@@ -43,34 +40,48 @@ jobs:
           sudo apt-get install -y cmake ninja-build wget unzip
 
       - name: Download Android NDK r26d
-        
-        
         run: |
           wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
           unzip -q android-ndk-r26d-linux.zip
           echo "NDK_PATH=$(pwd)/android-ndk-r26d" >> $GITHUB_ENV
 
-      - name: Patch telemetry.cpp
+      - name: Show telemetry files
+        run: |
+          find cactus-src -name "telemetry*" | head -20
+          echo "---"
+          find cactus-src/android -type f | head -20
+
+      - name: Patch telemetry
         run: |
           TELEM=$(find cactus-src -name "telemetry.cpp" | head -1)
           HEADER=$(find cactus-src -name "telemetry.h" | head -1)
-          if [ -n "$TELEM" ] && [ -n "$HEADER" ]; then
-            # Генерируем заглушку из заголовка
+          echo "telemetry.cpp: $TELEM"
+          echo "telemetry.h: $HEADER"
+          if [ -n "$HEADER" ]; then
+            echo "=== telemetry.h ===" && cat "$HEADER"
+          fi
+          if [ -n "$TELEM" ]; then
             cat > "$TELEM" << 'STUB'
-          // STUB: telemetry disabled for Android build (no libcurl in NDK)
-          #include "telemetry.h"
-          namespace cactus { namespace telemetry {
-            void init(const char*, const char*, const char*) {}
-            void recordInit(const char*, bool, double, const char*) {}
-            void recordCompletion(const char*, int, int, double, double, bool) {}
-            void recordError(const char*, const char*) {}
-            void flush() {}
-            void shutdown() {}
-          }}
-          STUB
-            echo "✅ telemetry.cpp patched"
-          else
-            echo "⚠️ telemetry.cpp not found, skipping patch"
+#include "telemetry.h"
+#include <string>
+namespace cactus { namespace telemetry {
+  void setTelemetryEnvironment(const char*, const char*, const char*) {}
+  void setAppId(const char*) {}
+  void setCloudKey(const char*) {}
+  void setCloudDisabled(bool) {}
+  void setStreamMode(bool) {}
+  void init(const char*, const char*, const char*) {}
+  void recordInit(const char*, bool, double, const char*) {}
+  void recordCompletion(const char*, const CompletionMetrics&) {}
+  void recordTranscription(const char*, bool, double, double, double, int, double, const char*) {}
+  void recordStreamTranscription(const char*, bool, double, double, double, int, double, double, double, int, const char*) {}
+  void flush() {}
+  void shutdown() {}
+  std::string loadCachedCloudApiKey() { return ""; }
+  void cacheCloudApiKey(const char*) {}
+}}
+STUB
+            echo "✅ patched"
           fi
 
       - name: Configure CMake
@@ -91,14 +102,17 @@ jobs:
         run: |
           cd build-${{ matrix.device }}
           ninja -j$(nproc)
-          SO=$(find . -name "*.so" | grep -v "stl" | head -1)
-          echo "Found: $SO"
+
+      - name: Find and upload
+        run: |
+          SO=$(find build-${{ matrix.device }} -name "*.so" | grep -v "stl\|c++_shared" | head -1)
+          echo "Found SO: $SO"
+          ls -lh "$SO"
           cp "$SO" "${{ matrix.artifact }}"
-          ls -lh "${{ matrix.artifact }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: build-${{ matrix.device }}/${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
           retention-days: 30
